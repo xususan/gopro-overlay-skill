@@ -96,51 +96,143 @@ TZ=UTC stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%S UTC" <VIDEO>.MP4
 
 #### 3e: Quick alignment check before full render
 
-Before rendering the full video, do a quick alignment check by rendering only a short clip. This
-saves significant time since full renders can take 25+ minutes for long videos.
+Before rendering the full video, render a short clip and verify alignment. The timecode-derived
+estimate is usually within a few seconds, but the GoPro's clock often drifts 4–8s from the Garmin's
+GPS-synced clock and that drift will be very visible in the final video.
 
-First, find when actual movement starts in the FIT data — the beginning of a race video is often
-the rider standing still at the start line:
-
-```python
-import fitdecode, datetime
-video_start_utc = datetime.datetime(...)  # from step 3c
-with fitdecode.FitReader('<FILE>.fit') as f:
-    for frame in f:
-        if isinstance(frame, fitdecode.FitDataMessage) and frame.name == 'record':
-            ts = frame.get_value('timestamp')
-            speed = frame.get_value('speed')
-            if ts and ts >= video_start_utc and speed and speed * 3.6 > 15:
-                offset = (ts - video_start_utc).total_seconds()
-                print(f'Movement starts {offset:.0f}s into video')
-                break
-```
-
-Then trim to a short clip starting just before the action, and render only that:
+Render a 1–2 minute test clip (covering at least one full lap if it's a circuit race) with the
+gopro-dashboard command from Step 6. This takes ~60–90s instead of 25+ minutes for the full video.
 
 ```bash
-ffmpeg -y -ss <OFFSET_SECONDS> -i <VIDEO>.MP4 -t 45 -c copy <VIDEO>-trim.mp4
+ffmpeg -y -ss <OFFSET_SECONDS> -i <VIDEO>.MP4 -t 120 -c copy <VIDEO>-trim.mp4
 TZ=UTC touch -t <ADJUSTED_TIMESTAMP> <VIDEO>-trim.mp4
 ```
 
 The touch timestamp for the trimmed clip must account for the trim offset:
 `trim_timestamp = original_video_start_utc + trim_offset_seconds`
 
-Render the short clip with the same gopro-dashboard command (Step 6) using the trimmed file. This
-takes ~30 seconds instead of 25+ minutes. Ask the user to verify alignment.
+#### 3f: Verify alignment using map dot vs camera at corners
 
-#### 3f: Fine-tuning
+**This step requires Claude to be able to read images** (the Read tool on .jpg files, or computer
+vision via screenshots). If you can't read images, skip to **3f-manual** below.
 
-The GoPro's clock often drifts several seconds from the Garmin's GPS-synced clock. Offsets of 4-8
-seconds are common. If the user reports the overlay is ahead or behind:
-- **Overlay ahead of video**: decrease the timestamp (shift earlier)
-- **Overlay behind video**: increase the timestamp (shift later)
+The rendered overlay includes a map with a position dot drawn from FIT GPS data. When the dot
+reaches a circuit corner, the camera should also be turning that corner. Any mismatch is your
+alignment offset, measured directly from the rendered video.
 
-After adjusting, re-render the short test clip to verify before committing to the full render.
+Why this works (and why naive cross-correlation doesn't): for a circuit race, ACCL/speed signals
+are highly periodic across laps, so cross-correlating GoPro accelerometer with FIT speed produces
+multiple equally-strong peaks at lap intervals. Matching a *spatial* event (dot position on the
+circuit map) is unambiguous regardless of which lap you're on.
 
-When applying the correction to the full video, subtract the same offset from the original
-(untrimmed) video's UTC start time. For example, if the test clip needed an 8-second correction,
-apply that same 8 seconds to the full video's touch timestamp.
+**Procedure:**
+
+1. **Find sharp corners from FIT GPS.** Detect moments where the heading changes >60° (smoothed
+   over ±5s). Take the sharpest 2–3 corners that fall within the test clip's time window:
+
+   ```python
+   import fitdecode, datetime, numpy as np
+   video_start_utc = datetime.datetime(...)  # touch timestamp of trimmed clip, as UTC
+   clip_duration = 120  # seconds
+
+   positions = []
+   with fitdecode.FitReader('<FILE>.fit') as f:
+       for frame in f:
+           if isinstance(frame, fitdecode.FitDataMessage) and frame.name == 'record':
+               ts = frame.get_value('timestamp')
+               lat_raw = frame.get_value('position_lat', fallback=None)
+               lon_raw = frame.get_value('position_long', fallback=None)
+               if ts and lat_raw is not None and lon_raw is not None:
+                   t = (ts.replace(tzinfo=datetime.timezone.utc) - video_start_utc).total_seconds()
+                   if 0 <= t <= clip_duration:
+                       positions.append((t, lat_raw * (180.0/2**31), lon_raw * (180.0/2**31)))
+
+   headings = []
+   for i in range(1, len(positions)):
+       dlat = positions[i][1] - positions[i-1][1]
+       dlon = positions[i][2] - positions[i-1][2]
+       headings.append((positions[i][0], np.arctan2(dlon, dlat) * 180/np.pi))
+
+   corners = []
+   for i in range(5, len(headings)-5):
+       hb = np.mean([h for _,h in headings[i-5:i]])
+       ha = np.mean([h for _,h in headings[i+1:i+6]])
+       diff = abs(ha - hb); diff = 360-diff if diff > 180 else diff
+       if diff > 60:
+           corners.append((headings[i][0], diff))
+
+   unique = []
+   for c in corners:
+       if not unique or c[0] - unique[-1][0] > 5:
+           unique.append(c)
+   for t, d in sorted(unique, key=lambda x: -x[1])[:3]:
+       print(f"corner candidate: t={t:.0f}s, turn={d:.0f}°")
+   ```
+
+2. **Extract a frame at each corner time, cropped to show both the map and the camera view.**
+   For Max Lens Mod (3840x3360), the map is in the upper-right; crop with `crop=1200:1400:2640:0`.
+   For 1920x1080 layouts, adjust the crop to capture the map widget along with enough of the camera
+   image to read body lean and the road ahead:
+
+   ```bash
+   for t in <corner_t1> <corner_t2> <corner_t3>; do
+     ffmpeg -y -ss $t -i <VIDEO>-trim-overlay.mp4 -frames:v 1 \
+       -vf "crop=1200:1400:2640:0" /tmp/align_corner_${t}s.jpg
+   done
+   ```
+
+3. **Read each frame and check that the dot and camera agree.** For each frame:
+   - Find the position dot inside the zoomed circuit map (typically a small map with a red rectangle
+     showing the circuit boundary). Note where the dot sits on the rectangle.
+   - Find the camera view. A bike mid-corner shows: visible frame tilt, road curving in the
+     direction of travel, the rider leaning, often a speed dip and high power on the way out.
+   - If the dot is at a corner of the rectangle AND the camera is mid-turn → aligned.
+   - If the dot has already passed the corner while the camera is still on the straight before it
+     → overlay is **ahead** → decrease the touch timestamp.
+   - If the camera is already past the corner while the dot is still on the straight before it
+     → overlay is **behind** → increase the touch timestamp.
+
+4. **Estimate the offset by extracting more frames around the corner.** If misaligned, extract
+   additional frames at ±2s, ±4s, ±6s around the corner time and find the offset where dot and
+   camera agree:
+
+   ```bash
+   CORNER_T=22
+   for d in -6 -4 -2 0 2 4 6; do
+     t=$((CORNER_T + d))
+     ffmpeg -y -ss $t -i <VIDEO>-trim-overlay.mp4 -frames:v 1 \
+       -vf "crop=1200:1400:2640:0" /tmp/align_${CORNER_T}_off${d}s.jpg
+   done
+   ```
+
+   The offset `d` of the frame where the camera is mid-corner (while the FIT-driven dot was at the
+   corner at `t=CORNER_T`) is the correction in seconds. Apply it to the touch timestamp:
+   - **Camera reaches corner *later* than dot** (overlay ahead) → subtract `d` from the timestamp.
+   - **Camera reaches corner *earlier* than dot** (overlay behind) → add `d` to the timestamp.
+
+5. **Re-touch and re-render the test clip** with the adjusted timestamp. Repeat verification until
+   dot and camera agree at multiple corners.
+
+When applying the correction to the full video, use the same offset on the original (untrimmed)
+video's UTC start time.
+
+#### 3f-manual: Fallback when image reading isn't available
+
+If you can't read images, render the test clip and ask the user to verify alignment. The GoPro's
+clock often drifts several seconds from the Garmin's GPS-synced clock; offsets of 4–8s are common.
+If the user reports the overlay is ahead or behind:
+- **Overlay ahead of video**: decrease the touch timestamp (shift earlier)
+- **Overlay behind video**: increase the touch timestamp (shift later)
+
+After adjusting, re-render the short test clip and ask the user to verify before committing to the
+full render. When applying the correction to the full video, subtract the same offset from the
+original (untrimmed) video's UTC start time.
+
+> **Don't try cross-correlating GoPro ACCL with FIT speed/power for circuit races.** It looks
+> attractive (both signals exist, both reflect the same physical activity) but lap-by-lap
+> periodicity creates many equally-strong correlation peaks at multiples of the lap period, and the
+> reported "best" peak is often wrong by tens of seconds. Use the spatial corner-matching approach
+> above instead.
 
 ### Step 4: Check video resolution
 
@@ -202,8 +294,8 @@ Ask the user to review the output video, checking:
 2. **Layout**: Are overlay elements properly positioned and readable?
 3. **Data**: Do values look reasonable for the activity?
 
-If alignment is off, go back to Step 3f — re-render a short test clip with the adjusted timestamp
-before re-rendering the full video.
+If alignment is off, go back to Step 3f (or 3f-manual) — re-render a short test clip with the
+adjusted timestamp before re-rendering the full video.
 
 ## Available profiles
 
